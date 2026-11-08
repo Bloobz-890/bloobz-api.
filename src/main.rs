@@ -65,6 +65,27 @@ fn provider_of(value: &Option<String>, id: Option<&str>) -> Result<CatalogProvid
     }
 }
 
+fn base_of(s: &AppState, headers: &HeaderMap) -> String {
+    s.public_url.clone().unwrap_or_else(|| {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
+        let proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        format!("{proto}://{host}")
+    })
+}
+
+fn keyq(s: &AppState) -> String {
+    match &s.api_key {
+        Some(k) => format!("&key={}", enc(k)),
+        None => String::new(),
+    }
+}
+
 fn enc(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
@@ -119,6 +140,7 @@ struct SearchQ {
 
 async fn search(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<SearchQ>,
 ) -> Result<Json<Value>, ApiError> {
     let mode = mode_of(&q.kind)?;
@@ -128,6 +150,21 @@ async fn search(
         CatalogProvider::Anikoto2 => s.v2.search(&q.q, mode).await,
     }
     .map_err(map_err)?;
+    let base = base_of(&s, &headers);
+    let kq = keyq(&s);
+    let results: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert(
+                    "episodes_url".into(),
+                    Value::String(format!("{base}/episodes?id={}&type={mode}{kq}", enc(&r.id))),
+                );
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({ "provider": provider.to_string(), "count": results.len(), "results": results })))
 }
 
@@ -141,6 +178,7 @@ struct EpisodesQ {
 
 async fn episodes(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<EpisodesQ>,
 ) -> Result<Json<Value>, ApiError> {
     let mode = mode_of(&q.kind)?;
@@ -150,7 +188,18 @@ async fn episodes(
         CatalogProvider::Anikoto2 => s.v2.episodes(&q.id, mode).await,
     }
     .map_err(map_err)?;
-    Ok(Json(json!({ "id": q.id, "type": mode.to_string(), "count": list.len(), "episodes": list })))
+    let base = base_of(&s, &headers);
+    let kq = keyq(&s);
+    let eps: Vec<Value> = list
+        .iter()
+        .map(|e| {
+            json!({
+                "episode": e,
+                "stream_url": format!("{base}/stream?id={}&ep={}&type={mode}{kq}", enc(&q.id), enc(e))
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "id": q.id, "type": mode.to_string(), "count": eps.len(), "episodes": eps })))
 }
 
 #[derive(Deserialize)]
@@ -175,17 +224,7 @@ async fn stream(
     }
     .map_err(map_err)?;
 
-    let base = s.public_url.clone().unwrap_or_else(|| {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost");
-        let proto = headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("http");
-        format!("{proto}://{host}")
-    });
+    let base = base_of(&s, &headers);
 
     let mut out = Vec::new();
     for link in &streams {
