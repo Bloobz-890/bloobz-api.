@@ -1,4 +1,10 @@
-use std::{net::IpAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use ani_lib::{
     provider_from_show_id, AniError, AnikotoClient, AnikotoCzClient, CatalogProvider,
@@ -26,6 +32,7 @@ struct AppState {
     http: reqwest::Client,
     api_key: Option<String>,
     public_url: Option<String>,
+    cache: Mutex<HashMap<String, (Instant, Value)>>,
 }
 
 struct ApiError(StatusCode, String);
@@ -121,7 +128,10 @@ async fn index() -> Json<Value> {
             "GET /search?q=&type=sub|dub&provider=anikoto2|anikoto": "search anime",
             "GET /episodes?id=&type=sub|dub": "list episodes for a show id from /search",
             "GET /stream?id=&ep=&type=sub|dub": "resolve stream links (each has a proxy_url usable by players)",
-            "GET /proxy?url=&referer=&origin=": "header-injecting proxy that rewrites HLS playlists"
+            "GET /proxy?url=&referer=&origin=": "header-injecting proxy that rewrites HLS playlists",
+            "GET /home": "catalog rows: trending, popular, airing, top (posters, scores, genres)",
+            "GET /explore?q=&genre=&year=&format=&status=&sort=&page=": "browse/search the catalog",
+            "GET /info?id=": "full details for a catalog id (description, relations, recommendations)"
         }
     }))
 }
@@ -394,6 +404,250 @@ async fn proxy(
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+// ---------------------------------------------------------------- catalog
+
+const MEDIA: &str = "id idMal title{romaji english native} coverImage{extraLarge large color} bannerImage averageScore episodes format status seasonYear genres nextAiringEpisode{episode airingAt}";
+
+async fn anilist(s: &AppState, query: String, vars: Value, ttl: u64) -> Result<Value, ApiError> {
+    let key = format!("{query}|{vars}");
+    {
+        let c = s.cache.lock().unwrap();
+        if let Some((t, v)) = c.get(&key) {
+            if t.elapsed().as_secs() < ttl {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let payload = json!({ "query": query, "variables": vars }).to_string();
+    let resp = s
+        .http
+        .post("https://graphql.anilist.co")
+        .header(header::USER_AGENT, UA)
+        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(payload)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("catalog error: {e}")))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("catalog read error: {e}")))?;
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let data_ok = body.get("data").map(|d| !d.is_null()).unwrap_or(false);
+    if !status.is_success() || !data_ok {
+        let msg = body["errors"][0]["message"].as_str().unwrap_or("catalog unavailable");
+        let code = if status.as_u16() == 404 { StatusCode::NOT_FOUND } else { StatusCode::BAD_GATEWAY };
+        return Err(ApiError(code, format!("catalog: {msg} (http {})", status.as_u16())));
+    }
+    let data = body["data"].clone();
+    {
+        let mut c = s.cache.lock().unwrap();
+        if c.len() > 400 {
+            c.clear();
+        }
+        c.insert(key, (Instant::now(), data.clone()));
+    }
+    Ok(data)
+}
+
+fn norm(m: &Value) -> Value {
+    let title = m["title"]["english"].as_str().or(m["title"]["romaji"].as_str());
+    json!({
+        "id": m["id"],
+        "mal_id": m["idMal"],
+        "title": title,
+        "romaji": m["title"]["romaji"],
+        "native": m["title"]["native"],
+        "poster": m["coverImage"]["extraLarge"],
+        "poster_small": m["coverImage"]["large"],
+        "color": m["coverImage"]["color"],
+        "banner": m["bannerImage"],
+        "score": m["averageScore"],
+        "episodes": m["episodes"],
+        "format": m["format"],
+        "status": m["status"],
+        "year": m["seasonYear"],
+        "genres": m["genres"],
+        "next": m["nextAiringEpisode"]
+    })
+}
+
+fn norm_list(v: &Value) -> Value {
+    let list: Vec<Value> = v.as_array().map(|a| a.iter().map(norm).collect()).unwrap_or_default();
+    Value::Array(list)
+}
+
+fn strip_html(s: &str) -> String {
+    let s = s.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+async fn home(State(s): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let q = r#"query {
+  trending: Page(perPage: 20) { media(type: ANIME, isAdult: false, sort: TRENDING_DESC) { MEDIA } }
+  airing: Page(perPage: 20) { media(type: ANIME, isAdult: false, status: RELEASING, sort: POPULARITY_DESC) { MEDIA } }
+  popular: Page(perPage: 20) { media(type: ANIME, isAdult: false, sort: POPULARITY_DESC) { MEDIA } }
+  top: Page(perPage: 20) { media(type: ANIME, isAdult: false, sort: SCORE_DESC) { MEDIA } }
+}"#
+    .replace("MEDIA", MEDIA);
+    let d = anilist(&s, q, json!({}), 900).await?;
+    Ok(Json(json!({
+        "trending": norm_list(&d["trending"]["media"]),
+        "airing": norm_list(&d["airing"]["media"]),
+        "popular": norm_list(&d["popular"]["media"]),
+        "top": norm_list(&d["top"]["media"])
+    })))
+}
+
+#[derive(Deserialize)]
+struct ExploreQ {
+    q: Option<String>,
+    genre: Option<String>,
+    year: Option<i64>,
+    format: Option<String>,
+    status: Option<String>,
+    sort: Option<String>,
+    page: Option<i64>,
+}
+
+async fn explore(
+    State(s): State<Arc<AppState>>,
+    Query(p): Query<ExploreQ>,
+) -> Result<Json<Value>, ApiError> {
+    let search = p.q.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let mut vars = serde_json::Map::new();
+    vars.insert("page".into(), json!(p.page.unwrap_or(1).clamp(1, 50)));
+    if let Some(v) = search {
+        vars.insert("search".into(), json!(v));
+    }
+    if let Some(v) = p.genre.as_deref().filter(|v| !v.is_empty()) {
+        vars.insert("genre".into(), json!(v));
+    }
+    if let Some(v) = p.year {
+        vars.insert("year".into(), json!(v));
+    }
+    if let Some(v) = p.format.as_deref().filter(|v| !v.is_empty()) {
+        let f = v.to_ascii_uppercase();
+        if !["TV", "TV_SHORT", "MOVIE", "OVA", "ONA", "SPECIAL"].contains(&f.as_str()) {
+            return Err(bad("invalid format"));
+        }
+        vars.insert("format".into(), json!(f));
+    }
+    if let Some(v) = p.status.as_deref().filter(|v| !v.is_empty()) {
+        let f = v.to_ascii_uppercase();
+        if !["RELEASING", "FINISHED", "NOT_YET_RELEASED"].contains(&f.as_str()) {
+            return Err(bad("invalid status"));
+        }
+        vars.insert("status".into(), json!(f));
+    }
+    let sort = match p.sort.as_deref().unwrap_or(if search.is_some() { "match" } else { "popular" }) {
+        "trending" => "TRENDING_DESC",
+        "score" => "SCORE_DESC",
+        "latest" => "START_DATE_DESC",
+        "title" => "TITLE_ROMAJI",
+        "match" => "SEARCH_MATCH",
+        _ => "POPULARITY_DESC",
+    };
+    vars.insert("sort".into(), json!([sort]));
+
+    let q = r#"query($page: Int, $search: String, $genre: String, $year: Int, $format: MediaFormat, $status: MediaStatus, $sort: [MediaSort]) {
+  Page(page: $page, perPage: 24) {
+    pageInfo { hasNextPage currentPage }
+    media(type: ANIME, isAdult: false, search: $search, genre: $genre, seasonYear: $year, format: $format, status: $status, sort: $sort) { MEDIA }
+  }
+}"#
+    .replace("MEDIA", MEDIA);
+    let d = anilist(&s, q, Value::Object(vars), 600).await?;
+    Ok(Json(json!({
+        "page": d["Page"]["pageInfo"]["currentPage"],
+        "has_next": d["Page"]["pageInfo"]["hasNextPage"],
+        "results": norm_list(&d["Page"]["media"])
+    })))
+}
+
+#[derive(Deserialize)]
+struct InfoQ {
+    id: i64,
+}
+
+async fn info(State(s): State<Arc<AppState>>, Query(p): Query<InfoQ>) -> Result<Json<Value>, ApiError> {
+    let q = r#"query($id: Int) {
+  Media(id: $id, type: ANIME) {
+    MEDIA
+    description(asHtml: false)
+    duration
+    popularity
+    startDate { year month day }
+    studios(isMain: true) { nodes { name } }
+    trailer { id site }
+    relations { edges { relationType node { id type format title { romaji english } coverImage { large } } } }
+    recommendations(perPage: 12, sort: RATING_DESC) { nodes { mediaRecommendation { MEDIA } } }
+  }
+}"#
+    .replace("MEDIA", MEDIA);
+    let d = anilist(&s, q, json!({ "id": p.id }), 1800).await?;
+    let m = &d["Media"];
+    if m.is_null() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found".into()));
+    }
+    let mut out = norm(m);
+    let relations: Vec<Value> = m["relations"]["edges"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["node"]["type"].as_str() == Some("ANIME"))
+                .map(|e| {
+                    let n = &e["node"];
+                    json!({
+                        "relation": e["relationType"],
+                        "id": n["id"],
+                        "title": n["title"]["english"].as_str().or(n["title"]["romaji"].as_str()),
+                        "poster": n["coverImage"]["large"],
+                        "format": n["format"]
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let recs: Vec<Value> = m["recommendations"]["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|n| !n["mediaRecommendation"].is_null())
+                .map(|n| norm(&n["mediaRecommendation"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    let studios: Vec<Value> = m["studios"]["nodes"]
+        .as_array()
+        .map(|a| a.iter().map(|n| n["name"].clone()).collect())
+        .unwrap_or_default();
+    if let Some(o) = out.as_object_mut() {
+        o.insert("description".into(), json!(strip_html(m["description"].as_str().unwrap_or(""))));
+        o.insert("duration".into(), m["duration"].clone());
+        o.insert("popularity".into(), m["popularity"].clone());
+        o.insert("start".into(), m["startDate"].clone());
+        o.insert("studios".into(), Value::Array(studios));
+        o.insert("trailer".into(), m["trailer"].clone());
+        o.insert("relations".into(), Value::Array(relations));
+        o.insert("recommendations".into(), Value::Array(recs));
+    }
+    Ok(Json(out))
+}
+
 #[tokio::main]
 async fn main() {
     let state = Arc::new(AppState {
@@ -405,6 +659,7 @@ async fn main() {
             .build()
             .expect("http client"),
         api_key: std::env::var("API_KEY").ok().filter(|v| !v.is_empty()),
+        cache: Mutex::new(HashMap::new()),
         public_url: std::env::var("PUBLIC_URL")
             .ok()
             .map(|v| v.trim_end_matches('/').to_string())
@@ -418,6 +673,9 @@ async fn main() {
         .route("/episodes", get(episodes))
         .route("/stream", get(stream))
         .route("/proxy", get(proxy))
+        .route("/home", get(home))
+        .route("/explore", get(explore))
+        .route("/info", get(info))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(CorsLayer::permissive())
         .with_state(state);
