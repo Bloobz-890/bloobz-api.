@@ -3,7 +3,7 @@ use std::{
     net::IpAddr,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ani_lib::{
@@ -129,7 +129,7 @@ async fn index() -> Json<Value> {
             "GET /episodes?id=&type=sub|dub": "list episodes for a show id from /search",
             "GET /stream?id=&ep=&type=sub|dub": "resolve stream links (each has a proxy_url usable by players)",
             "GET /proxy?url=&referer=&origin=": "header-injecting proxy that rewrites HLS playlists",
-            "GET /home": "catalog rows: trending, popular, airing, top (posters, scores, genres)",
+            "GET /home": "catalog rows: recent episodes, trending, popular, airing, top (posters, scores, genres)",
             "GET /explore?q=&genre=&year=&format=&status=&sort=&page=": "browse/search the catalog",
             "GET /info?id=": "full details for a catalog id (description, relations, recommendations)"
         }
@@ -503,8 +503,49 @@ async fn home(State(s): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
   top: Page(perPage: 20) { media(type: ANIME, isAdult: false, sort: SCORE_DESC) { MEDIA } }
 }"#
     .replace("MEDIA", MEDIA);
-    let d = anilist(&s, q, json!({}), 900).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        / 300
+        * 300;
+    let rq = r#"query($now: Int) {
+  Page(perPage: 50) {
+    airingSchedules(airingAt_lesser: $now, sort: TIME_DESC) { episode airingAt media { MEDIA isAdult } }
+  }
+}"#
+    .replace("MEDIA", MEDIA);
+    let (d, rd) = tokio::join!(
+        anilist(&s, q, json!({}), 900),
+        anilist(&s, rq, json!({ "now": now }), 300)
+    );
+    let d = d?;
+    let mut recent: Vec<Value> = Vec::new();
+    if let Ok(rd) = rd {
+        let mut seen: Vec<i64> = Vec::new();
+        for e in rd["Page"]["airingSchedules"].as_array().cloned().unwrap_or_default() {
+            let m = &e["media"];
+            if m.is_null() || m["isAdult"].as_bool() == Some(true) {
+                continue;
+            }
+            let id = m["id"].as_i64().unwrap_or(0);
+            if id == 0 || seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let mut item = norm(m);
+            if let Some(o) = item.as_object_mut() {
+                o.insert("episode".into(), e["episode"].clone());
+                o.insert("aired_at".into(), e["airingAt"].clone());
+            }
+            recent.push(item);
+            if recent.len() >= 20 {
+                break;
+            }
+        }
+    }
     Ok(Json(json!({
+        "recent": recent,
         "trending": norm_list(&d["trending"]["media"]),
         "airing": norm_list(&d["airing"]["media"]),
         "popular": norm_list(&d["popular"]["media"]),
