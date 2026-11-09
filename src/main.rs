@@ -422,7 +422,7 @@ async fn anilist(s: &AppState, query: String, vars: Value, ttl: u64) -> Result<V
     }
     let payload = json!({ "query": query, "variables": vars }).to_string();
     let mut last = ApiError(StatusCode::BAD_GATEWAY, "catalog unavailable".into());
-    for attempt in 1..=3u64 {
+    for attempt in 1..=2u64 {
         let sent = s
             .http
             .post("https://graphql.anilist.co")
@@ -430,14 +430,14 @@ async fn anilist(s: &AppState, query: String, vars: Value, ttl: u64) -> Result<V
             .header(header::ACCEPT, "application/json")
             .header(header::CONTENT_TYPE, "application/json")
             .body(payload.clone())
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(9))
             .send()
             .await;
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
                 last = ApiError(StatusCode::BAD_GATEWAY, format!("catalog error: {e}"));
-                tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                tokio::time::sleep(Duration::from_millis(300 * attempt)).await;
                 continue;
             }
         };
@@ -448,12 +448,12 @@ async fn anilist(s: &AppState, query: String, vars: Value, ttl: u64) -> Result<V
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(attempt)
-            .min(4);
+            .min(2);
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 last = ApiError(StatusCode::BAD_GATEWAY, format!("catalog read error: {e}"));
-                tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                tokio::time::sleep(Duration::from_millis(300 * attempt)).await;
                 continue;
             }
         };
