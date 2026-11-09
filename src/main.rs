@@ -410,47 +410,79 @@ const MEDIA: &str = "id idMal title{romaji english native} coverImage{extraLarge
 
 async fn anilist(s: &AppState, query: String, vars: Value, ttl: u64) -> Result<Value, ApiError> {
     let key = format!("{query}|{vars}");
+    let mut stale: Option<Value> = None;
     {
         let c = s.cache.lock().unwrap();
         if let Some((t, v)) = c.get(&key) {
             if t.elapsed().as_secs() < ttl {
                 return Ok(v.clone());
             }
+            stale = Some(v.clone());
         }
     }
     let payload = json!({ "query": query, "variables": vars }).to_string();
-    let resp = s
-        .http
-        .post("https://graphql.anilist.co")
-        .header(header::USER_AGENT, UA)
-        .header(header::ACCEPT, "application/json")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(payload)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("catalog error: {e}")))?;
-    let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("catalog read error: {e}")))?;
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    let data_ok = body.get("data").map(|d| !d.is_null()).unwrap_or(false);
-    if !status.is_success() || !data_ok {
-        let msg = body["errors"][0]["message"].as_str().unwrap_or("catalog unavailable");
-        let code = if status.as_u16() == 404 { StatusCode::NOT_FOUND } else { StatusCode::BAD_GATEWAY };
-        return Err(ApiError(code, format!("catalog: {msg} (http {})", status.as_u16())));
-    }
-    let data = body["data"].clone();
-    {
-        let mut c = s.cache.lock().unwrap();
-        if c.len() > 400 {
-            c.clear();
+    let mut last = ApiError(StatusCode::BAD_GATEWAY, "catalog unavailable".into());
+    for attempt in 1..=3u64 {
+        let sent = s
+            .http
+            .post("https://graphql.anilist.co")
+            .header(header::USER_AGENT, UA)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(payload.clone())
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await;
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                last = ApiError(StatusCode::BAD_GATEWAY, format!("catalog error: {e}"));
+                tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                continue;
+            }
+        };
+        let status = resp.status();
+        let wait = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(attempt)
+            .min(4);
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                last = ApiError(StatusCode::BAD_GATEWAY, format!("catalog read error: {e}"));
+                tokio::time::sleep(Duration::from_millis(700 * attempt)).await;
+                continue;
+            }
+        };
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let data_ok = body.get("data").map(|d| !d.is_null()).unwrap_or(false);
+        if status.is_success() && data_ok {
+            let data = body["data"].clone();
+            let mut c = s.cache.lock().unwrap();
+            if c.len() > 400 {
+                c.clear();
+            }
+            c.insert(key, (Instant::now(), data.clone()));
+            return Ok(data);
         }
-        c.insert(key, (Instant::now(), data.clone()));
+        let msg = body["errors"][0]["message"].as_str().unwrap_or("catalog unavailable").to_string();
+        if status.as_u16() == 404 {
+            return Err(ApiError(StatusCode::NOT_FOUND, format!("catalog: {msg} (http 404)")));
+        }
+        last = ApiError(StatusCode::BAD_GATEWAY, format!("catalog: {msg} (http {})", status.as_u16()));
+        if status.as_u16() == 429 || status.is_server_error() {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            continue;
+        }
+        break;
     }
-    Ok(data)
+    if let Some(v) = stale {
+        return Ok(v);
+    }
+    Err(last)
 }
 
 fn norm(m: &Value) -> Value {
@@ -516,7 +548,7 @@ async fn home(State(s): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
 }"#
     .replace("MEDIA", MEDIA);
     let (d, rd) = tokio::join!(
-        anilist(&s, q, json!({}), 900),
+        anilist(&s, q, json!({}), 1800),
         anilist(&s, rq, json!({ "now": now }), 300)
     );
     let d = d?;
@@ -611,7 +643,7 @@ async fn explore(
   }
 }"#
     .replace("MEDIA", MEDIA);
-    let d = anilist(&s, q, Value::Object(vars), 600).await?;
+    let d = anilist(&s, q, Value::Object(vars), 1800).await?;
     Ok(Json(json!({
         "page": d["Page"]["pageInfo"]["currentPage"],
         "has_next": d["Page"]["pageInfo"]["hasNextPage"],
@@ -639,7 +671,7 @@ async fn info(State(s): State<Arc<AppState>>, Query(p): Query<InfoQ>) -> Result<
   }
 }"#
     .replace("MEDIA", MEDIA);
-    let d = anilist(&s, q, json!({ "id": p.id }), 1800).await?;
+    let d = anilist(&s, q, json!({ "id": p.id }), 21600).await?;
     let m = &d["Media"];
     if m.is_null() {
         return Err(ApiError(StatusCode::NOT_FOUND, "not found".into()));
