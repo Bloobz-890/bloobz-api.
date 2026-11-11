@@ -404,6 +404,80 @@ async fn proxy(
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+
+#[derive(Deserialize)]
+struct FetchQ {
+    url: String,
+    referer: Option<String>,
+    origin: Option<String>,
+    ua: Option<String>,
+    cookie: Option<String>,
+    method: Option<String>,
+    body: Option<String>,
+    ctype: Option<String>,
+}
+
+/// Generic page fetch for repo plugins. Returns status, final url and the text body as JSON
+/// so a plugin can see exactly what the site answered (for example a 403 challenge page).
+async fn fetch_page(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<FetchQ>,
+) -> Result<Json<Value>, ApiError> {
+    let target = Url::parse(&q.url).map_err(|e| bad(format!("invalid url: {e}")))?;
+    if !allowed_target(&target) {
+        return Err(bad("target not allowed"));
+    }
+    let post = q.method.as_deref().map(|m| m.eq_ignore_ascii_case("POST")).unwrap_or(false);
+    let mut req = if post { s.http.post(target) } else { s.http.get(target) };
+    req = req
+        .timeout(Duration::from_secs(20))
+        .header(header::USER_AGENT, q.ua.as_deref().unwrap_or(UA))
+        .header(header::ACCEPT, "text/html,application/json,*/*;q=0.8")
+        .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+    if let Some(r) = &q.referer {
+        req = req.header(header::REFERER, r);
+    }
+    if let Some(o) = &q.origin {
+        req = req.header(header::ORIGIN, o);
+    }
+    if let Some(c) = &q.cookie {
+        req = req.header(header::COOKIE, c);
+    }
+    if post {
+        req = req
+            .header(header::CONTENT_TYPE, q.ctype.as_deref().unwrap_or("application/x-www-form-urlencoded"))
+            .body(q.body.clone().unwrap_or_default());
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("upstream error: {e}")))?;
+    let status = resp.status().as_u16();
+    let final_url = resp.url().to_string();
+    let ctype = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let server = resp
+        .headers()
+        .get(header::SERVER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("upstream read error: {e}")))?;
+    let cut = bytes.len().min(1_500_000);
+    let text = String::from_utf8_lossy(&bytes[..cut]).to_string();
+    Ok(Json(json!({
+        "status": status, "url": final_url, "type": ctype, "server": server,
+        "length": bytes.len(), "body": text
+    })))
+}
+
 // ---------------------------------------------------------------- catalog
 
 const MEDIA: &str = "id idMal title{romaji english native} coverImage{extraLarge large color} bannerImage averageScore episodes format status seasonYear genres nextAiringEpisode{episode airingAt}";
@@ -746,6 +820,7 @@ async fn main() {
         .route("/episodes", get(episodes))
         .route("/stream", get(stream))
         .route("/proxy", get(proxy))
+        .route("/fetch", get(fetch_page))
         .route("/home", get(home))
         .route("/explore", get(explore))
         .route("/info", get(info))
